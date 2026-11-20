@@ -1,0 +1,849 @@
+---
+title: "Constructing an Analysis-Ready Dataset from Safety-Net Electronic Health Records for Diabetic Retinopathy Epidemiology"
+subtitle: "University of Cambridge PACE — Healthcare Data Science Module 1 Assignment"
+author: "Seraina Kull"
+date: "20 November 2026"
+output:
+  html_document:
+    toc: true # add table of contents
+    toc_depth: 2 # table of contents depth, defaults to 3
+    toc_float: # always show table of contents when scrolling down, collapsed and smooth_scroll are on default settings
+      collapsed: true 
+      smooth_scroll: true
+    code_folding: hide   # use hide/show to collapse/display all code chunks by default
+    highlight: null # specifies syntax highlighting style, set to null to remove format from code chunks
+    css: auburn.css # add CSS document for custom style
+    includes:
+      after_body: darkmode.html # add the darkmode toggle at the bottom
+---
+
+
+## Safe Researcher Training Evidence
+
+<details>
+  <summary>Click to Expand Document</summary>
+  
+<iframe src="Confidentiality_and_Data_protection_in_health_research_Seraina Kull.pdf#toolbar=0" width="100%" height="600px" style="border: none;"></iframe>
+
+</details>
+
+## Coversheet
+
+<details>
+  <summary>Click to Expand Document</summary>
+  
+<iframe src="Assignment coversheet_Seraina Kull.pdf#toolbar=0" width="100%" height="600px" style="border: none;"></iframe>
+
+</details>
+
+```{r setup, include=FALSE}
+# PREREQUISITES
+# To knit this file, users need internet access and a working RMarkdown renderer (RStudio with rmarkdown and knitr installed)
+
+# set global knitr options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9.4,
+  fig.height = 4.7,
+  dpi = 300,
+  dev.args = list(bg = "transparent") # make plot backgrounds transparent to embed seemlessly in light/dark mode and reduce visual noise
+)
+
+# add random number generator seed for reproducible missing-data diagnostics and validation
+set.seed(123)
+
+# verify package loadability via requireNamespace (safe across R 4.6.x)
+required_packages <- c(
+  "tidyverse", "validate", "jsonlite", "digest",
+  "sandwich", "lmtest", "patchwork", "knitr", "scales"
+)
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org", dependencies = TRUE)
+}
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+# create output folders
+dir.create("data/raw", recursive = TRUE, showWarnings = FALSE)
+dir.create("data/ard", recursive = TRUE, showWarnings = FALSE)
+dir.create("metadata", recursive = TRUE, showWarnings = FALSE)
+
+# check for function conflicts between packages
+# tidyverse::tidyverse_conflicts()
+# conflicts(detail = TRUE)
+
+# set the default plot theme for consistency
+ggplot2::theme_set(ggplot2::theme_minimal(base_size = 10))
+# make plot backgrounds transparent to embed seemlessly in light/dark mode and reduce visual noise
+knitr::opts_chunk$set(dev.args = list(bg = "transparent"))
+```
+
+```{r data ingestion, include=FALSE}
+# define expected Dryad files (doi:10.5061/dryad.jwstqjqrm)
+dryad_doi <- "doi:10.5061/dryad.jwstqjqrm"
+
+expected_files <- c(
+  train_orig = "DRRisk_training_original.csv",
+  test_orig  = "DRRisk_test_original.csv",
+  ext_orig   = "DRRisk_external_validation_original.csv",
+  train_imp  = "DRRisk_training_imputed.csv",
+  test_imp   = "DRRisk_test_imputed.csv",
+  ext_imp    = "DRRisk_external_validation_imputed.csv"
+)
+
+local_paths <- file.path("data/raw", expected_files)
+names(local_paths) <- names(expected_files)
+
+# compute SHA-256 checksums identifying the six downloaded source files sizes for later validation
+raw_checksums <- tibble(
+  file_key = names(local_paths),
+  filename = unname(expected_files),
+  sha256 = vapply(local_paths, function(p) digest(file = p, algo = "sha256"), character(1)),
+  size_kb = round(file.info(local_paths)$size / 1024, 1)
+)
+
+# helper function to read CSVs and standardise column headers
+read_lacdhs_csv <- function(path, split_label, period_label) {
+  df <- read_csv(path, show_col_types = FALSE)
+  names(df) <- toupper(trimws(names(df)))
+  df %>%
+    mutate(
+      cohort_split = split_label,
+      calendar_period = period_label,
+      source_file = basename(path)
+    )
+}
+
+# create dataframe from the three non-imputed filea
+raw_orig <- bind_rows(
+  read_lacdhs_csv(local_paths["train_orig"], "train_2015_17", "2015-2017"),
+  read_lacdhs_csv(local_paths["test_orig"],  "test_2015_17",  "2015-2017"),
+  read_lacdhs_csv(local_paths["ext_orig"],   "ext_val_2018",  "2018")
+)
+
+# str(raw_orig)
+
+# create dataframe from the three imputed files
+raw_imp <- bind_rows(
+  read_lacdhs_csv(local_paths["train_imp"], "train_2015_17", "2015-2017"),
+  read_lacdhs_csv(local_paths["test_imp"],  "test_2015_17",  "2015-2017"),
+  read_lacdhs_csv(local_paths["ext_imp"],   "ext_val_2018",  "2018")
+)
+
+# define the continuous variables
+cont_vars <- c(
+  "DURATION_OF_DIABETES_YRS", "HEMOGLOBIN_A1C", "BLOOD_UREA_NITROGEN",
+  "SYSTOLIC_BLOOD_PRESSURE", "DIASTOLIC_BLOOD_PRESSURE", "HEMOGLOBIN", "TRIGLYCERIDES"
+)
+
+# loop through the continuous biomarkers of both files to create a descriptive comparison of observed and KNN-imputed distributions
+dual_track_audit <- map_dfr(cont_vars, function(v) {
+  x_orig <- raw_orig[[v]]
+  x_imp  <- raw_imp[[v]]
+  tibble(
+    Variable = v,
+    `Missing in Original (%)` = round(mean(is.na(x_orig)) * 100, 2),
+    `Missing in Imputed (%)`  = round(mean(is.na(x_imp)) * 100, 2),
+    `Original Mean (SD)`      = sprintf("%.2f (%.2f)", mean(x_orig, na.rm = TRUE), sd(x_orig, na.rm = TRUE)),
+    `KNN-Imputed Mean (SD)`   = sprintf("%.2f (%.2f)", mean(x_imp, na.rm = TRUE), sd(x_imp, na.rm = TRUE)),
+    `SD Ratio (Imputed / Observed)`      = round(sd(x_imp, na.rm = TRUE) / sd(x_orig, na.rm = TRUE), 3)
+  )
+})
+
+```
+
+```{r ARD engineering, include=FALSE}
+
+# apply the project-specified cleaning and new columns
+ard_df <- raw_orig %>%
+  mutate(
+    # assign row IDs (these are note verified person IDs) - allows for tracing back to source file row from the ARD via the lineage table
+    patient_seq_id = row_number(),
+    cohort_split = factor(cohort_split, levels = c("train_2015_17", "test_2015_17", "ext_val_2018")),
+    calendar_period = factor(calendar_period, levels = c("2015-2017", "2018")),
+
+    # primary outcome: prevalent diabetic retinopathy (Y = 1, N = 0 for modified Poisson regression) and add descriptive labels ("No_DR", "DR_Present")
+    dr_raw = toupper(trimws(as.character(RETINOPATHY))),
+    dr_status = case_when(
+      dr_raw == "Y" ~ 1L,
+      dr_raw == "N" ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    dr_factor = factor(dr_status, levels = c(0L, 1L), labels = c("No_DR", "DR_Present")),
+
+    # store the 10-year age brackets as an ordered factor
+    age_group = ordered(
+      trimws(as.character(AGE)),
+      levels = c("18-29", "30-39", "40-49", "50-59", "60-69", "70-79", "80+")
+    ),
+
+    # recode extreme/implausible values to NA while retaining the observation
+    # these are screening rules, not proof that every excluded measurement is erroneous
+    duration_yrs_clean = if_else(
+      DURATION_OF_DIABETES_YRS < 0 | DURATION_OF_DIABETES_YRS > 85,
+      NA_real_, as.numeric(DURATION_OF_DIABETES_YRS)
+    ),
+    hba1c_clean = if_else(
+      HEMOGLOBIN_A1C < 3.0 | HEMOGLOBIN_A1C > 25.0,
+      NA_real_, as.numeric(HEMOGLOBIN_A1C)
+    ),
+    bun_clean = if_else(
+      BLOOD_UREA_NITROGEN <= 0 | BLOOD_UREA_NITROGEN > 250,
+      NA_real_, as.numeric(BLOOD_UREA_NITROGEN)
+    ),
+    sbp_clean = if_else(
+      SYSTOLIC_BLOOD_PRESSURE < 50 | SYSTOLIC_BLOOD_PRESSURE > 300,
+      NA_real_, as.numeric(SYSTOLIC_BLOOD_PRESSURE)
+    ),
+    dbp_clean = if_else(
+      DIASTOLIC_BLOOD_PRESSURE < 30 | DIASTOLIC_BLOOD_PRESSURE > 200 |
+        (!is.na(sbp_clean) & DIASTOLIC_BLOOD_PRESSURE >= sbp_clean),
+      NA_real_, as.numeric(DIASTOLIC_BLOOD_PRESSURE)
+    ),
+    hemoglobin_clean = if_else(
+      HEMOGLOBIN < 3.0 | HEMOGLOBIN > 25.0,
+      NA_real_, as.numeric(HEMOGLOBIN)
+    ),
+    triglycerides_clean = if_else(
+      TRIGLYCERIDES <= 0 | TRIGLYCERIDES > 5000,
+      NA_real_, as.numeric(TRIGLYCERIDES)
+    ),
+
+    # operational threshold-based predictors; no claim of clinical diagnoses
+    glycemic_control_cat = factor(
+      case_when(
+        is.na(hba1c_clean) ~ NA_character_,
+        hba1c_clean < 7.0 ~ "Controlled_lt7",
+        hba1c_clean < 9.0 ~ "Suboptimal_7_to_8.9",
+        TRUE ~ "Uncontrolled_ge9"
+      ),
+      levels = c("Controlled_lt7", "Suboptimal_7_to_8.9", "Uncontrolled_ge9")
+    ),
+    stage2_htn_flag = if_else(
+      is.na(sbp_clean) | is.na(dbp_clean),
+      NA,
+      (sbp_clean >= 140 | dbp_clean >= 90)
+    ),
+    renal_azotemia_flag = if_else(
+      is.na(bun_clean),
+      NA,
+      (bun_clean > 20)
+    ),
+
+    # define masked binary demographic and comorbidity variables (preserving non-disclosed coding explicitly)
+    sex_code = factor(paste0("Code_", SEX), levels = c("Code_0", "Code_1")),
+    ethnicity_code = factor(paste0("Code_", ETHNICITY), levels = c("Code_0", "Code_1")),
+    insulin_dep_code = factor(paste0("Code_", INSULIN_DEPENDENCE), levels = c("Code_1", "Code_2")),
+    nephropathy_code = factor(paste0("Code_", NEPHROPATHY), levels = c("Code_1", "Code_2")),
+    neuropathy_code = factor(paste0("Code_", NEUROPATHY), levels = c("Code_1", "Code_2")),
+    stroke_code = factor(paste0("Code_", STROKE), levels = c("Code_1", "Code_2")),
+
+    # Count missingness after cleaning: includes source missingness and newly removed values
+    miss_hba1c = is.na(hba1c_clean),
+    miss_bun = is.na(bun_clean),
+    miss_bp = is.na(sbp_clean) | is.na(dbp_clean),
+    miss_hemoglobin = is.na(hemoglobin_clean),
+    miss_triglycerides = is.na(triglycerides_clean),
+    miss_duration = is.na(duration_yrs_clean),
+    lab_missing_count = as.integer(
+      miss_hba1c + miss_bun + miss_bp + miss_hemoglobin + miss_triglycerides + miss_duration
+    )
+  ) %>%
+  # select and order the exact 29 governed ARD variables, dropping temporary columns, to guarantee a clean, predictable schema for downstream users
+  select(
+    patient_seq_id, cohort_split, calendar_period,
+    dr_status, dr_factor,
+    age_group, sex_code, ethnicity_code,
+    duration_yrs_clean, hba1c_clean, glycemic_control_cat,
+    bun_clean, renal_azotemia_flag,
+    sbp_clean, dbp_clean, stage2_htn_flag,
+    hemoglobin_clean, triglycerides_clean,
+    insulin_dep_code, nephropathy_code, neuropathy_code, stroke_code,
+    miss_hba1c, miss_bun, miss_bp, miss_hemoglobin, miss_triglycerides, miss_duration,
+    lab_missing_count
+  )
+
+# validate the completed analysis-ready dataset using automated validation function
+source("ARD_validation.R")
+
+ard_validation <- validate_ard(
+  raw_orig = raw_orig,
+  ard_df = ard_df,
+  expected_files = expected_files
+)
+validation_summary <- ard_validation$summary
+```
+
+## Abstract {-}
+
+**Background:** This project prepares an analysis-ready dataset from Los Angeles County Department of Health Services electronic health records to support adjusted prevalence-ratio estimation for diabetic retinopathy.
+
+**Methods:** A reproducible R workflow integrates the three original, de-identified files from Dryad (`doi:10.5061/dryad.jwstqjqrm`) into an ARD. The workflow preserves cohort provenance and source missingness and applies documented screening and derivation rules. Automated source-to-ARD checks support data integrity. A separate complete-case modified Poisson model with robust standard errors demonstrates the ARD's use in 2015–2017 and 2018.
+
+**Results:** The ARD contains `r format(nrow(ard_df), big.mark = ",")` records and 29 variables, with observed diabetic retinopathy prevalence of `r sprintf("%.2f%%", mean(ard_df$dr_status) * 100)`. Source-to-ARD checks confirm that the constructed dataset meets its specified requirements. The outputs include a variable dictionary, metadata, source-record reconciliation, and reusable CSV/RDS files. Period-specific models provide adjusted prevalence ratios with robust confidence intervals and explicit accounting of the records analysed.
+
+**Conclusion:** The project extends the reuse of a prediction-oriented data release through an auditable, documented ARD for prevalence-association analysis. Its contribution is the calibration of data preparation, analytical definitions and validation with a clearly specified epidemiological use.
+
+---
+
+# Introduction
+
+Diabetic retinopathy (DR), one of the most common complications of both type 2 diabetes mellitus and type 1 diabetes mellitus, encompasses a collection of microvascular complications (Sabanayagam et al., 2016; Wong, 2009, cited in Sivaprasad et al., 2025). DR
+is a leading cause of preventable blindness among working-age adults worldwide, with particularly medically underserved populations in resource-constrained settings facing late screenings and vision-threatening microvascular progression (Teo et al., 2021; Ogunyemi et al., 2021).
+
+The Los Angeles County Department of Health Services (LACDHS) is part of the healthcare safety net, a set of healthcare actors providing care to underinsured and low-income populations in the United States (Chatterjee, 2025). As such, routinely-collected data from LACDHS' screenings and patient care programmes is a valuable healthcare research asset.
+
+Ogunyemi et al. (2021) used these electronic health records (EHRs) to support clinicians in identifying undiagnosed DR patients for subsequent screening and treatment. In September 2026, the research group released 49,931 observations of the patient-level study data under a Public Domain license for secondary analysis. For this research project, I take the lens of a lead health data scientist at an epidemiology lab, reassess data engineering and data wrangling decisions taken by Ogunyemi et al. (2021), and create an analysis-ready dataset for downstream analysis.
+
+## Research Question
+
+The primary aim is to prepare and document an ARD for prevalence-association analysis. The subsequent analysis asks how glycaemic status, diabetes duration, blood-pressure thresholds and elevated blood urea nitrogen (BUN) are associated with prevalent DR in each calendar period, conditional on the other included variables. To arrive at the secondary, analytical question, this project used the PECO framework. However, due to the limitations of the scope of this report, an illustrative model will only partially answer the analytical research question. The ARD as primary output will enable downstream researchers to fully investigate the PECO-derived question.
+
+* **Population ($P$):** Adults with Type 1 or Type 2 diabetes who received teleretinal screening or an in-person eye examination at LACDHS during 2015–2018. The data release describes 49,931 distinct patients (Ogunyemi et al., 2021; Daskivich, Gandhi and Ogunyemi, 2026).
+* **Exposure ($E$):** HbA1c category (`<7.0%`, `7.0–8.9%`, `>=9.0%`), duration of diabetes, the indicator for SBP >= 140 mmHg or DBP >= 90 mmHg, and elevated BUN (`>20 mg/dL`). The model also includes age group and the masked sex, ethnicity, insulin-dependence, nephropathy, neuropathy and stroke categories. Haemoglobin, triglycerides and continuous blood-pressure/HbA1c measurements are retained in the ARD to support a broader range of secondary analyses.
+* **Comparator ($C$):** HbA1c < 7.0% is the glycaemic reference category, the blood-pressure and elevated-BUN threshold indicators compare `TRUE` with `FALSE`, and diabetes duration is expressed per additional year. Masked factors use their documented code-level references. Age is retained as an ordered factor, using R's default polynomial contrasts in this implementation.
+* **Outcome ($O$):** Existing DR (`dr_status`, `1` = present, `0` = absent). Separate models estimate adjusted prevalence ratios (PRs) in 2015–2017 and 2018.
+
+---
+
+# Methods
+
+##  Data Source
+
+This project uses the LACDHS Cerner ORCHID dataset deposited on Dryad (`doi:10.5061/dryad.jwstqjqrm`, published September 2026, downloaded on 7 November 2026) by Daskivich, Gandhi and Ogunyemi (2026). The source is a set of pre-cleaned, de-identified analytic files suitable for secondary use. This deposit contains 49,931 distinct adults across a 2015–2017 training split ($n = 27,223$), a 2015–2017 internal test split ($n = 13,408$), and a distinct 2018 cohort ($n = 9,300$). Each cohort is available in original and KNN-imputed form (Ogunyemi et al., 2021; Daskivich, Gandhi and Ogunyemi, 2026). The two versions represent the same cohorts, but only the original versions contribute records to the ARD.
+
+The source study developed machine-learning classifiers to support prioritisation of DR screening. Their workflow combined KNN imputation, a suitable approach to address missingness for a project aiming at supporting clinical decisions (Ogunyemi et al., 2021). Although a valid data engineering approach for their purposes, every imputation of missing data is an analysis-specific statistical assumption and presents the possibility of introducing unintended bias. Imputation is not a neutral data cleaning step.
+
+For a report with an ARD as the primary output, this can mean that downstream analysts can no longer differentiate between the synthetic approximations of previously missing data and clinically observed values. Since I cannot rule out missingness not at random (MNAR), retaining missingness itself can also bias the analysis. Nevertheless, this project will create an ARD with the originally observed variable distributions for the following reasons:
+
+1. Retaining raw missingness preserves the ground truth in a reusable ARD.
+2. A complete-case demonstration provides a transparent baseline without synthetic assumptions.
+3. Missingness itself can be informative.
+
+For the analytical part, this project uses Modified Poisson regression with Huber–White robust standard errors because it directly estimates prevalence ratios for the cross-sectional research question (Barros and Hirakata, 2003; Zou, 2004; Zeileis, 2006). Prevalence ratios express the relative prevalence of DR across exposure groups and are easy to interpret when the outcome is common.
+
+## Data Preparation Workflow
+
+The workflow has five stages:
+
+1. **Compare observed and imputed distributions.** SHA-256 checksums identify the six downloaded files that create the basis for this project. A comparison of means, standard deviations, and missingness across seven continuous variables serves as a documented assessment of the two available data versions (imputed and observed). The SD ratio summarises the completed-file distribution relative to the observed-value distribution, marking the changes in spread. The original files are selected for ARD construction.
+2. **Integrate cohorts while preserving membership.** The three original files are combined into one consistently structured ARD. The earlier training and test splits are combined for the 2015–2017 association analysis while their source labels are retained. The 2018 cohort remains separately identifiable for period-specific, external comparison.
+3. **Apply explicit screening rules and derive analytical predictors.** Following the Kahn et al. (2016) framework of atemporal and relational plausibility, this project applies the following screening ranges: HbA1c 3–25%, SBP 50–300 mmHg, DBP 30–200 mmHg, BUN >0–250 mg/dL, haemoglobin 3–25 g/dL, triglycerides >0–5,000 mg/dL and diabetes duration 0–85 years, with DBP also set to `NA` when it is at least the cleaned SBP. Values outside these rules become `NA`, while patient records are retained. Automated checks confirm that zero records in the released cohort fall outside these bounds. Operational HbA1c groups (`<7.0%`, `7.0–8.9%`, and `>=9.0%`) and blood-pressure threshold indicators (`SBP >=140 mmHg` or `DBP >=90 mmHg`) align with clinical benchmarks in the American Diabetes Association *Standards of Care* (American Diabetes Association Professional Practice Committee for Diabetes, 2026), providing reproducible exposure variables alongside the retained continuous measurements.
+4. **Preserve masked categories and describe them.** Sex, ethnicity, and four clinical indicators retain their factor encoding. New code-based labels preserve the available information consistently across summaries and models, while avoiding assigning misleading coding revealing the masked values. Their undisclosed category meanings are documented in the accompanying data dictionary.
+5. **Data validation.** Before and after exporting the ARD and releasing it for subsequent analysis, automated checks compare  the ARD as the output of the data preparation workflow to defined specifications. 
+
+## FAIR Principles and the Five Safes
+
+The original LACDHS datasets' accompanying README, the Public Domain licence, and the DOI support reusability, accessibility, and findability (Wilkinson et al., 2016; Daskivich, Gandhi and Ogunyemi, 2026). The original file options further allow for alternative treatment of missing values. This project contributes a unified ARD, an expanded variable dictionary, transformation specifications and a source-record lookup, contributing to all four FAIR principles (Wilkinson et al., 2016).
+
+As for the Five Safes (Desai, Ritchie and Welpton, 2016), the source study was particularly strong in ensuring safe data and safe outputs. The study thoroughly de-identified the EHRs and added privacy features to the 2026-released dataset that went as far as masking the binary encoding of comorbid conditions. Although this research would be able to assign the underlying value based on its distributions and associations with the exposure variable, I elect not to disclose the values in this project's outputs, the ARD, either. I further take no steps to undo the other privacy-enhancing actions and de-identification performed by Daskivich, Gandhi and Ogunyemi (2026). This, in addition to the Safe Researcher Training Evidence available, attests to my contribution to safe people.
+
+The public access solution to the dataset release sits at one extreme of the way data is accessed. It is probable that the source study's authors chose such stringent data protection actions on the dataset itself because there are virtually no restrictions on data download. 
+
+## Reproducibility
+
+With the source data being in the Public Domain, reproducibility is facilitated by storing the `.Rmd` report used to create present report alongside the six source datasets and all remaining documents needed to create the report in its intended form. The accompanying `README` guides the user on environment specifications and actions to take to reproduce the report. Please access the [Public GitHub repository HDS-M1](https://github.com/SerainaKull/HDS-M1) to access the README and follow its instructions to recreate present project.
+
+```{r table1-dual-track, echo=FALSE}
+# format the observed vs. KNN-imputed comparison tibble into a clean HTML table
+kable(
+  dual_track_audit,
+  caption = "Table 1. Descriptive Comparison of Observed and KNN-Imputed Values Across Seven Continuous Variables."
+)
+```
+
+---
+
+# Results
+
+## Cohort Characteristics
+
+The ARD contains `r format(nrow(ard_df), big.mark = ",")` records. Observed DR prevalence is `r sprintf("%.2f%%", mean(ard_df$dr_status[ard_df$calendar_period == "2015-2017"]) * 100)` in 2015–2017 and `r sprintf("%.2f%%", mean(ard_df$dr_status[ard_df$calendar_period == "2018"]) * 100)` in 2018 (`r sprintf("%.2f%%", mean(ard_df$dr_status) * 100)` overall). Indeed, several measurements appear consistent over the 2015-2017 cohorts, but differ in the external 2018 cohort. This initial contrast indicates that maintaining the source temporal split is useful for the prevalence-ratio analysis. Table 2 describes the cohort splits and selected measurements. Since zero observations fell outside the screening ranges, the HbA1c missingness column reflects original source missingness.
+
+```{r table2-cohort-summary}
+# helper function computes sample size, DR prevalence, medians/IQRs (for skewed variables), means/SDs (for roughly symmetric variables), and missingness
+summarise_cohort <- function(df_sub, label) {
+  tibble(
+    Cohort = label,
+    N = nrow(df_sub),
+    `DR Prevalence (%)` = sprintf("%.2f%%", mean(df_sub$dr_status) * 100),
+    `Duration Yrs, Median (IQR)` = sprintf(
+      "%.1f (%.1f–%.1f)",
+      median(df_sub$duration_yrs_clean, na.rm = TRUE),
+      quantile(df_sub$duration_yrs_clean, 0.25, na.rm = TRUE),
+      quantile(df_sub$duration_yrs_clean, 0.75, na.rm = TRUE)
+    ),
+    `HbA1c (%), Mean (SD)` = sprintf(
+      "%.2f (%.2f)",
+      mean(df_sub$hba1c_clean, na.rm = TRUE),
+      sd(df_sub$hba1c_clean, na.rm = TRUE)
+    ),
+    `HbA1c Missing After Cleaning (%)` = sprintf("%.1f%%", mean(df_sub$miss_hba1c) * 100),
+    `SBP (mmHg), Mean (SD)` = sprintf(
+      "%.1f (%.1f)",
+      mean(df_sub$sbp_clean, na.rm = TRUE),
+      sd(df_sub$sbp_clean, na.rm = TRUE)
+    ),
+    `BUN (mg/dL), Median (IQR)` = sprintf(
+      "%.1f (%.1f–%.1f)",
+      median(df_sub$bun_clean, na.rm = TRUE),
+      quantile(df_sub$bun_clean, 0.25, na.rm = TRUE),
+      quantile(df_sub$bun_clean, 0.75, na.rm = TRUE)
+    ),
+    `Age >= 60 Yrs (%)` = sprintf(
+      "%.1f%%",
+      mean(df_sub$age_group %in% c("60-69", "70-79", "80+")) * 100
+    )
+  )
+}
+
+# summarise characteristics across cohorts
+table2_df <- bind_rows(
+  summarise_cohort(ard_df, "Unified ARD (2015–2018)"),
+  summarise_cohort(dplyr::filter(ard_df, calendar_period == "2015-2017"), "Combined 2015-2017 Cohort"),
+  summarise_cohort(dplyr::filter(ard_df, cohort_split == "train_2015_17"), "Train Split (2015–2017)"),
+  summarise_cohort(dplyr::filter(ard_df, cohort_split == "test_2015_17"), "Test Split (2015–2017)"),
+  summarise_cohort(dplyr::filter(ard_df, cohort_split == "ext_val_2018"), "External Cohort (2018)")
+)
+
+# display table
+kable(
+  table2_df,
+  caption = "Table 2. Epidemiological Baseline Characteristics, Outcome Prevalence, and Missingness Across LACDHS Temporal Cohorts."
+)
+```
+## The Model
+
+```{r figure1, eval=FALSE, fig.cap="Figure 1. (A) Triglyceride distributions in the observed and KNN-imputed releases. (B) Missingness by DR status", include=FALSE}
+# removing this to decrease word count
+# plot observed vs. KNN-imputed triglycerides to show how imputation alters lab distributions
+p1a <- bind_rows(
+  tibble(Source = "Original (Observed)", Value = raw_orig$TRIGLYCERIDES) %>% dplyr::filter(!is.na(Value)),
+  tibble(Source = "Curator KNN-Imputed", Value = raw_imp$TRIGLYCERIDES) %>% dplyr::filter(!is.na(Value))
+) %>%
+  ggplot(aes(x = Value, fill = Source, color = Source)) +
+  geom_density(alpha = 0.35, linewidth = 0.8) +
+  scale_fill_manual(values = c("#d95f02", "#1b4f72")) +
+  scale_color_manual(values = c("#d95f02", "#1b4f72")) +
+  labs(
+    title = "A. Observed and KNN-Imputed Triglycerides",
+    x = "Triglycerides (mg/dL)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+ 
+# put missingness flags into long format to show difference in DR outcome status
+p1b <- ard_df %>%
+  group_by(dr_factor) %>%
+  summarise(
+    `Triglycerides` = mean(miss_triglycerides),
+    `Hemoglobin` = mean(miss_hemoglobin),
+    `HbA1c` = mean(miss_hba1c),
+    `BUN` = mean(miss_bun),
+    `Diabetes Duration` = mean(miss_duration),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-dr_factor, names_to = "Biomarker", values_to = "Missing_Rate") %>%
+  ggplot(aes(x = reorder(Biomarker, Missing_Rate), y = Missing_Rate, fill = dr_factor)) +
+  geom_col(position = "dodge", width = 0.68) +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("#5d6d7e", "#1b4f72"), name = "Outcome") +
+  labs(
+    title = "B. Missingness After Cleaning by DR Status",
+    x = NULL,
+    y = "Proportion Missing After Cleaning"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+
+# combine plots 1 and 2 side-by-side
+# apply grey text that is readable in light and dark mode and does not distract from the data
+fig1 <- (p1a + p1b) &
+  theme(
+    plot.background = element_rect(fill = "transparent", colour = NA),
+    text = element_text(colour = "#808080"),
+    axis.text = element_text(colour = "#808080"),
+    panel.grid.major = element_line(colour = "#80808040"),
+    panel.grid.minor = element_blank()
+  )
+
+fig1
+```
+
+```{r cleaning-audit, include=FALSE}
+# do not show output since permissive criteria introduced no new missingness
+# leaving this chunk in case downstream users tighten plausibility ranges
+# print the audit comparing original missingness vs. potential newly introduced missingness
+kable(
+  ard_validation$cleaning_audit,
+  caption = "Cleaning audit: original missing values, additional values set to NA by the project rules, and final missingness."
+)
+```
+
+
+```{r table-polarity, include=FALSE}
+# removing the polarity table from the report due to word count restraints
+# group the four masked clinical indicators by Code_1 vs. Code_2 and summarise other variables 
+polarity_vars <- c("insulin_dep_code", "nephropathy_code", "neuropathy_code", "stroke_code")
+
+table3_df <- map_dfr(polarity_vars, function(v) {
+  ard_df %>%
+    group_by(Code_Level = .data[[v]]) %>%
+    summarise(
+      Variable = v,
+      N = n(),
+      `DR Prevalence (%)` = sprintf("%.2f%%", mean(dr_status) * 100),
+      `Mean HbA1c (%)` = sprintf("%.2f", mean(hba1c_clean, na.rm = TRUE)),
+      `Median Duration (Yrs)` = sprintf("%.1f", median(duration_yrs_clean, na.rm = TRUE)),
+      `Median BUN (mg/dL)` = sprintf("%.1f", median(bun_clean, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    select(Variable, Code_Level, N, `DR Prevalence (%)`, `Mean HbA1c (%)`, `Median Duration (Yrs)`, `Median BUN (mg/dL)`)
+})
+
+# display as table
+kable(
+  table3_df,
+  caption = "Table 3. Descriptive Summaries Within Masked Clinical Indicator Levels (Code_1 vs. Code_2); Category Meanings Remain Undisclosed."
+)
+```
+
+Figure 1 applies a modified Poisson specification separately in each calendar period and displays five selected adjusted prevalence-ratio contrasts with robust confidence intervals. Using a consistent specification supports direct comparison of the estimated associations. The legend reports the complete-case sample size for each period (with 16,043 records omitted in 2015–2017 and 2,355 in 2018 due to missing model variables).
+
+The wider 2018 CIs are expected, since the complete-case sample size ($n = 6,945$) was smaller than for the 2015-2017 cohort ($n = 24,588$). Nevertheless, the CIs overlap heavily for each factor, indicating stability for the risk-factor relationship strength over time. 
+
+Interpretation example: Patients with elevated blood urea nitrogen (`BUN >20 mg/dL`) have roughly 1.51 to 1.65 times the prevalence of DR compared to patients with lower BUN in 2015-2017, even after accounting for blood sugar and diabetes duration.
+
+```{r figure1-modified-poisson, echo=FALSE, fig.cap="Figure 1. Selected adjusted prevalence ratios with 95% robust confidence intervals from separate complete-case models in 2015–2017 and 2018. Legend counts are the actual model sample sizes; this is an exploratory period comparison."}
+
+# Modified Poisson regression
+fit_mod_poisson <- function(df_sub, period_name) {
+  mod <- glm(
+    dr_status ~ glycemic_control_cat + duration_yrs_clean + stage2_htn_flag +
+      renal_azotemia_flag + age_group + sex_code + ethnicity_code +
+      insulin_dep_code + nephropathy_code + neuropathy_code + stroke_code,
+    data = df_sub,
+    family = poisson(link = "log"),
+    na.action = na.omit
+  )
+  vcov_rob <- vcovHC(mod, type = "HC0")
+  ct <- coeftest(mod, vcov. = vcov_rob)
+  ci <- coefci(mod, vcov. = vcov_rob, level = 0.95)
+  tibble(
+    Period = sprintf("%s (complete-case n=%s)", period_name,
+                     format(nobs(mod), big.mark = ",")),
+    Input_N = nrow(df_sub),
+    Model_N = nobs(mod),
+    Omitted_N = nrow(df_sub) - nobs(mod),
+    Term = rownames(ct),
+    log_pr = ct[, 1],
+    ci_low_log = ci[, 1],
+    ci_high_log = ci[, 2]
+  ) %>%
+    dplyr::filter(Term %in% c(
+      "glycemic_control_catSuboptimal_7_to_8.9",
+      "glycemic_control_catUncontrolled_ge9",
+      "duration_yrs_clean",
+      "stage2_htn_flagTRUE",
+      "renal_azotemia_flagTRUE"
+    )) %>%
+    mutate(
+      PR = exp(log_pr),
+      CI_low = exp(ci_low_log),
+      CI_high = exp(ci_high_log),
+      Label = recode(
+        Term,
+        "glycemic_control_catSuboptimal_7_to_8.9" = "HbA1c 7.0–8.9% (vs <7%)",
+        "glycemic_control_catUncontrolled_ge9" = "HbA1c >= 9.0% (vs <7%)",
+        "duration_yrs_clean" = "Diabetes Duration (per year)",
+        "stage2_htn_flagTRUE" = "BP threshold (SBP >=140 or DBP >=90)",
+        "renal_azotemia_flagTRUE" = "Elevated BUN (>20 mg/dL)"
+      )
+    )
+}
+
+# run the same model on 2015-2017 and 2018 individually and combine the estimates to demonstrate how unified ARD supports consistent cross-period comparison
+pr_results <- bind_rows(
+  fit_mod_poisson(dplyr::filter(ard_df, calendar_period == "2015-2017"), "2015–2017"),
+  fit_mod_poisson(dplyr::filter(ard_df, calendar_period == "2018"), "2018")
+)
+
+# plot prevalence ratios and confidence intervals to show effect direction, precision, and temporal stability
+fig2 <- ggplot(pr_results, aes(x = PR, y = reorder(Label, PR), color = Period)) +
+  geom_vline(xintercept = 1.0, linetype = "dashed", color = "#7f8c8d") +
+  geom_errorbarh(
+    aes(xmin = CI_low, xmax = CI_high),
+    height = 0.22,
+    position = position_dodge(width = 0.45),
+    linewidth = 0.8
+  ) +
+  geom_point(position = ggplot2::position_dodge(width = 0.45), size = 2.6) +
+  scale_color_manual(values = c("#1b4f72", "#d95f02")) +
+  labs(
+    title = "Adjusted Prevalence Ratios for Diabetic Retinopathy Across Temporal Cohorts",
+    x = "Adjusted Prevalence Ratio (95% Huber–White Robust CI)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom") +
+  theme(
+    plot.background = element_rect(fill = "transparent", colour = NA),
+    text = element_text(colour = "#808080"),
+    axis.text = element_text(colour = "#808080"),
+    panel.grid.major = element_line(colour = "#80808040"),
+    panel.grid.minor = element_blank()
+  )
+
+fig2
+```
+
+```{r table3, include=FALSE}
+# print table showing total records, complete cases analysed, and omitted rows to make complete-case attrition explicit
+model_sample_audit <- unique(
+  pr_results[, c("Period", "Input_N", "Model_N", "Omitted_N")]
+)
+kable(
+  model_sample_audit,
+  caption = "Illustrative model samples: available records, complete cases analysed, and records omitted for missing model variables."
+)
+```
+
+## Automated Validation and ARD Export
+
+The workflow checked conformity with the documented ARD specification before analysis and verified the exported data files afterwards. Failed required checks stop execution. 40 validation rules passed all checks with zero failures. The automated validation checks the following aspects:
+
+* Dataset structure and column types
+* Record retention and unique identifiers
+* Cohort provenance and calendar periods
+* Outcome coding
+* Demographic and clinical category preservation
+* Measurement plausibility
+* Clinical indicators 
+* Missingness flags
+* Exported RDS and CSV fidelity
+
+The workflow script also exports the ARD as both a native R `.rds` file and a `.csv` file. Providing the two files improves interoperability by giving downstream analysts an option that is optimised for R, as well as an option that is universally machine-readable.
+
+Metadata-related files that are exported include an extensive data dictionary as a `.csv` file, a metadata `.json` file, and a record lineage `.csv` file. These three files explain the data structure, phenotyping, and how the ARD was constructed from the source files.
+
+```{r export-governed-artifacts, include=FALSE}
+# save the ARD as CSV (universal) and as native R .rds file (preserves factor orders and types)
+ard_csv_path <- "data/ard/ARD_lacdhs_dr_v1.csv"
+ard_rds_path <- "data/ard/ARD_lacdhs_dr_v1.rds"
+
+write_csv(ard_df, ard_csv_path)
+saveRDS(ard_df, ard_rds_path)
+ard_sha256 <- digest(file = ard_csv_path, algo = "sha256")
+
+# variable definitions
+dict_definitions <- tibble::tribble(
+  ~variable, ~description, ~unit, ~source_variable, ~coding, ~derivation, ~reference_or_contrast, ~analysis_role,
+  "patient_seq_id", "Generated source-record identifier; not an independently verified patient identifier", "record", "Source row in combined original files", "Positive integer", "row_number() assigned before ARD selection; source-file and within-file record lookup exported separately", "Identifier; not a model term", "Record reconciliation",
+  "cohort_split", "Original machine-learning partition retained as provenance", "not applicable", "Source filename", "train_2015_17; test_2015_17; ext_val_2018", "Assigned from the original input file; not re-randomised", "First level train_2015_17; not a term in the illustrative model", "Provenance and cohort accounting",
+  "calendar_period", "Calendar period of the source cohort", "calendar years", "Source filename", "2015-2017; 2018", "Assigned from input cohort; no exact patient dates are introduced", "Separate models are fitted by period", "Period-specific analysis",
+  "dr_status", "Presence of existing diabetic retinopathy", "binary", "RETINOPATHY", "0 = absent; 1 = present", "Trim and uppercase source text; N -> 0, Y -> 1, anything else -> NA and outcome validation fails", "0 denotes absence; model response is integer 0/1", "Outcome",
+  "dr_factor", "Labelled representation of the DR outcome", "not applicable", "RETINOPATHY / dr_status", "No_DR; DR_Present", "Factor derived from dr_status with levels 0 and 1", "No_DR is the first factor level", "Descriptive summaries",
+  "age_group", "Age brackets supplied in the public release", "years, grouped", "AGE", "18-29; 30-39; 40-49; 50-59; 60-69; 70-79; 80+", "Trim source text and preserve these ordered levels; unexpected values become NA and fail validation", "Ordered factor; R default polynomial contrasts, not one reference age group", "Included adjustment variable",
+  "sex_code", "Masked sex category; original category meanings are undisclosed", "not applicable", "SEX", "Code_0; Code_1; NA for missing source", "Preserve source code as a factor; no clinical or demographic relabelling", "Code_0 under default treatment contrasts", "Included adjustment variable",
+  "ethnicity_code", "Masked ethnicity category; original category meanings are undisclosed", "not applicable", "ETHNICITY", "Code_0; Code_1; NA for missing source", "Preserve source code as a factor; no clinical or demographic relabelling", "Code_0 under default treatment contrasts", "Included adjustment variable",
+  "duration_yrs_clean", "Duration of diabetes after project-specified screening", "years", "DURATION_OF_DIABETES_YRS", "Numeric; NA may originate in the source or from the screening rule", "Keep source value when 0 <= value <= 85; otherwise NA. Bounds are analyst-specified assumptions, not validated physiological limits.", "Per additional year", "Included exposure",
+  "hba1c_clean", "HbA1c measurement after project-specified screening", "%", "HEMOGLOBIN_A1C", "Numeric; NA may originate in the source or from the screening rule", "Keep source value when 3 <= value <= 25; otherwise NA. Bounds are analyst-specified assumptions, not validated physiological limits.", "Used to derive glycaemic categories", "Retained continuous measurement",
+  "glycemic_control_cat", "Operational HbA1c group; labels do not establish individual treatment targets", "not applicable", "hba1c_clean", "Controlled_lt7; Suboptimal_7_to_8.9; Uncontrolled_ge9", "<7%; >=7% and <9%; >=9%; NA when hba1c_clean is missing", "Controlled_lt7 (<7%)", "Included exposure",
+  "bun_clean", "Blood urea nitrogen measurement after project-specified screening", "mg/dL", "BLOOD_UREA_NITROGEN", "Numeric; NA may originate in the source or from the screening rule", "Keep source value when 0 < value <= 250; otherwise NA. Bounds are analyst-specified assumptions, not validated physiological limits.", "Used to derive BUN threshold flag", "Retained continuous measurement",
+  "renal_azotemia_flag", "Operational BUN threshold indicator; does not establish renal disease", "logical", "bun_clean", "FALSE; TRUE; NA", "TRUE for BUN >20 mg/dL, FALSE otherwise; NA for missing BUN", "FALSE (BUN <=20 mg/dL)", "Included exposure",
+  "sbp_clean", "Systolic blood-pressure measurement after project-specified screening", "mmHg", "SYSTOLIC_BLOOD_PRESSURE", "Numeric; NA may originate in the source or from the screening rule", "Keep source value when 50 <= value <= 300; otherwise NA. Bounds are analyst-specified assumptions, not validated physiological limits.", "Used to derive BP threshold flag", "Retained continuous measurement",
+  "dbp_clean", "Diastolic blood-pressure measurement after project-specified screening", "mmHg", "DIASTOLIC_BLOOD_PRESSURE", "Numeric; NA may originate in the source or from the screening rule", "Keep source value when 30 <= value <= 200; additionally value < cleaned SBP when SBP is observed; otherwise NA. Bounds are analyst-specified assumptions, not validated physiological limits.", "Used to derive BP threshold flag", "Retained continuous measurement",
+  "stage2_htn_flag", "Operational BP threshold indicator; does not establish a hypertension diagnosis", "logical", "sbp_clean; dbp_clean", "FALSE; TRUE; NA", "NA if either pressure is missing; otherwise TRUE when SBP >=140 or DBP >=90 mmHg", "FALSE (SBP <140 and DBP <90 mmHg)", "Included exposure",
+  "hemoglobin_clean", "Haemoglobin measurement after project-specified screening", "g/dL", "HEMOGLOBIN", "Numeric; NA may originate in the source or from the screening rule", "Keep source value when 3 <= value <= 25; otherwise NA. Bounds are analyst-specified assumptions, not validated physiological limits.", "Not in the illustrative model", "Retained for subsequent analyses",
+  "triglycerides_clean", "Triglyceride measurement after project-specified screening", "mg/dL", "TRIGLYCERIDES", "Numeric; NA may originate in the source or from the screening rule", "Keep source value when 0 < value <= 5000; otherwise NA. Bounds are analyst-specified assumptions, not validated physiological limits.", "Not in the illustrative model", "Retained for subsequent analyses",
+  "insulin_dep_code", "Masked insulin-dependence category; original category meanings are undisclosed", "not applicable", "INSULIN_DEPENDENCE", "Code_1; Code_2; NA for missing source", "Preserve source code as a factor; do not infer presence or absence from descriptive associations", "Code_1 under default treatment contrasts", "Included adjustment variable",
+  "nephropathy_code", "Masked nephropathy category; original category meanings are undisclosed", "not applicable", "NEPHROPATHY", "Code_1; Code_2; NA for missing source", "Preserve source code as a factor; do not infer presence or absence from descriptive associations", "Code_1 under default treatment contrasts", "Included adjustment variable",
+  "neuropathy_code", "Masked neuropathy category; original category meanings are undisclosed", "not applicable", "NEUROPATHY", "Code_1; Code_2; NA for missing source", "Preserve source code as a factor; do not infer presence or absence from descriptive associations", "Code_1 under default treatment contrasts", "Included adjustment variable",
+  "stroke_code", "Masked stroke category; original category meanings are undisclosed", "not applicable", "STROKE", "Code_1; Code_2; NA for missing source", "Preserve source code as a factor; do not infer presence or absence from descriptive associations", "Code_1 under default treatment contrasts", "Included adjustment variable",
+  "miss_hba1c", "HbA1c missing after cleaning; includes source missingness and newly censored values", "logical", "hba1c_clean", "FALSE = observed after cleaning; TRUE = missing after cleaning", "is.na(hba1c_clean); does not establish why a measurement is missing", "Not a model term; not a correction for missing-data bias", "Missingness documentation",
+  "miss_bun", "BUN missing after cleaning; includes source missingness and newly censored values", "logical", "bun_clean", "FALSE = observed after cleaning; TRUE = missing after cleaning", "is.na(bun_clean); does not establish why a measurement is missing", "Not a model term; not a correction for missing-data bias", "Missingness documentation",
+  "miss_bp", "One or both blood-pressure measurements missing after cleaning; includes source missingness and newly censored values", "logical", "sbp_clean; dbp_clean", "FALSE = observed after cleaning; TRUE = missing after cleaning", "is.na(sbp_clean) OR is.na(dbp_clean); does not establish why a measurement is missing", "Not a model term; not a correction for missing-data bias", "Missingness documentation",
+  "miss_hemoglobin", "Haemoglobin missing after cleaning; includes source missingness and newly censored values", "logical", "hemoglobin_clean", "FALSE = observed after cleaning; TRUE = missing after cleaning", "is.na(hemoglobin_clean); does not establish why a measurement is missing", "Not a model term; not a correction for missing-data bias", "Missingness documentation",
+  "miss_triglycerides", "Triglycerides missing after cleaning; includes source missingness and newly censored values", "logical", "triglycerides_clean", "FALSE = observed after cleaning; TRUE = missing after cleaning", "is.na(triglycerides_clean); does not establish why a measurement is missing", "Not a model term; not a correction for missing-data bias", "Missingness documentation",
+  "miss_duration", "Diabetes duration missing after cleaning; includes source missingness and newly censored values", "logical", "duration_yrs_clean", "FALSE = observed after cleaning; TRUE = missing after cleaning", "is.na(duration_yrs_clean); does not establish why a measurement is missing", "Not a model term; not a correction for missing-data bias", "Missingness documentation",
+  "lab_missing_count", "Number of missing grouped measurements after cleaning; not a count of individual laboratory tests", "count, 0-6", "Six miss_* indicators", "Integer from 0 to 6", "Sum six miss_* flags; BP contributes at most one, and diabetes duration is included", "Not a model term", "Missingness documentation"
+)
+
+# combine summary statistics and variable definitions and save as a CSV data dictionary
+dict_df <- tibble(
+  variable = names(ard_df),
+  r_class = vapply(ard_df, function(x) paste(class(x), collapse = ";"), character(1)),
+  n_total = nrow(ard_df),
+  n_missing = colSums(is.na(ard_df)),
+  pct_missing = round(colMeans(is.na(ard_df)) * 100, 2)
+) %>%
+  left_join(dict_definitions, by = "variable")
+write_csv(dict_df, "metadata/ARD_lacdhs_dr_dictionary.csv")
+
+# save machine-readable JSON metadata with dataset provenance, SHA-256 digests, and the full data dictionary to support FAIR interoperability so automated pipelines can inspect schema without having to parse prose documents
+fair_metadata <- list(
+  dataset_id = "ARD_lacdhs_dr_v1",
+  title = "Analysis-Ready Los Angeles County Safety-Net Diabetes EHR Dataset for Diabetic Retinopathy Epidemiology",
+  version = "1.0.0",
+  created_utc = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+  license = "CC0-1.0 (Derived from Dryad doi:10.5061/dryad.jwstqjqrm)",
+  target_analytical_method = "Illustrative complete-case modified Poisson regression with robust standard errors for prevalence associations",
+  provenance = list(
+    source_doi = dryad_doi,
+    raw_files = raw_checksums,
+    ard_csv_sha256 = ard_sha256,
+    n_rows = nrow(ard_df),
+    n_cols = ncol(ard_df)
+  ),
+  variables = dict_df
+)
+write_json(fair_metadata, "metadata/ARD_lacdhs_dr_metadata.json", pretty = TRUE, auto_unbox = TRUE)
+
+# define phenotype specification, then reproduction instructions and save as Markdown to fulfil the reproducibility deliverables
+phenotype_md <- c(
+  "# Computational Phenotype Specification: LACDHS Diabetic Retinopathy ARD (v1.0.0)",
+  "",
+  "- **PHENO-01 (`dr_status`):** Binary outcome (`1` = Diabetic Retinopathy present at teleretinal/ophthalmologic exam; `0` = absent).",
+  "- **PHENO-02 (`glycemic_control_cat`):** Operational HbA1c groups: <7%; >=7% and <9%; >=9%. Missing cleaned HbA1c produces a missing category. Internal labels do not establish individual treatment targets.",
+  "- **PHENO-03 (`stage2_htn_flag`):** TRUE if cleaned SBP >=140 mmHg or DBP >=90 mmHg; NA if either pressure is missing. This is an operational threshold flag, not a hypertension diagnosis.",
+  "- **PHENO-04 (`renal_azotemia_flag`):** TRUE if cleaned BUN >20 mg/dL; NA if BUN is missing. This flag does not establish renal disease.",
+  "- **PHENO-05 (`miss_*` flags):** Missingness after cleaning, including original missingness and values newly set to NA. lab_missing_count sums six grouped indicators; BP counts once if either pressure is missing. These flags do not establish why data are missing."
+)
+writeLines(phenotype_md, "phenotypes_specification.md")
+
+readme_md <- c(
+  "# Reproducible GitHub Archive: LACDHS Diabetic Retinopathy ARD (`HDS_M1_Seraina Kull_2611`)",
+  "",
+  "## Reproducibility",
+  "1. Place all six downloaded Dryad analytic CSV files (`doi:10.5061/dryad.jwstqjqrm`) in data/raw/ relative to this Rmd file; place ARD_validation.R beside the Rmd. Retain the CSS (auburn.css), HTML (darkmode.html) and attached-PDF (Assignment coversheet_Seraina Kull.pdf & Confidentiality_and_Data_protection_in_health_research_Seraina Kull.pdf) assets and place them beside the Rmd.",
+  "2. Run rmarkdown::render('HDS_M1_Seraina Kull_2611.Rmd') in R (>=4.2.0) or click 'Knit the current document' in RStudio. Packages must be available; setup attempts to install missing packages require an internet connection. Please also see the VLE submission (HDS_M1_Seraina-Kull_2611.html) for exact session information that created the intended HTML report",
+  "3. The pipeline computes SHA-256 digests identifying the input files, checks the ARD specification and saved CSV/RDS, and regenerates data/ard/ and metadata/. Input digests are not compared with a trusted external manifest.",
+  "4. For best performance, open the report HTML in Chrome or Edge browser. The PDF files will not render in the RStudio HTML viewer. As both PDFs contain information that is not suitable to be shared in a public repository, please refer to the VLE submission for the Safe Researcher Training Evidence and the Coversheet instead."
+)
+writeLines(readme_md, "README.md")
+
+# verify that the saved datasets reproduce the validated data
+export_checks <- verify_ard_exports(
+  ard_df = ard_df,
+  csv_path = ard_csv_path,
+  rds_path = ard_rds_path
+)
+
+validation_summary <- rbind(validation_summary, export_checks)
+
+# save the source-record lookup as CSV
+readr::write_csv(
+  ard_validation$lineage,
+  "metadata/ARD_lacdhs_dr_record_lineage.csv"
+)
+```
+
+```{r table4-validation, include=FALSE}
+# display table of source-to-ARD and saved-file validation results to demonstrate that specification checks passed
+knitr::kable(
+  validation_summary[, c("Check", "Requirement", "Evaluated", "Failed", "Status")],
+  caption = "Table 4. Checks Against the ARD Specification, Including Saved-File Integrity.",
+  row.names = FALSE
+)
+```
+
+
+---
+
+# Discussion and Conclusion
+
+This project successfully delivered an analysis-ready dataset to facilitate a specified epidemiological analysis. The data preparation workflow facilitated the main contributions of the project, namely the integration of cohort provenance, reproducible data transformations, missingness documentation, interpretable variable definitions, and automated validation within one workflow.
+
+The detailed data dictionary and record lineage files make those decisions inspectable and supports subsequent reuse of data and the period-specific models demonstrate how the ARD supports consistent association analysis across the two calendar periods.
+
+The resulting ARD provides a documented, reusable foundation for prevalence-association analysis, with a worked application and clear guidance on the assumptions relevant to further use.
+
+## Limitations and Future Research
+
+1. **Population and interpretation:** The resulting associations apply to patients who received eye examinations only. As Ogunyemi et al. (2021) pointed out, the patients who are at highest risk of DR are often the ones facing the greatest barriers to accessing diabetes care. Given that the source data is based on routinely-collected data during screenings a disproportionately affected population is less likely to receive, this projects identified associations might not apply to the wider population of people with diabetes.
+
+2. **Missingness and category meanings:** Although the majority of the source dataset was used for modelling, retaining missingness led to the omission of 18,398 patients. Present research was designed to investigate complete cases and the source data is large, but future research might want to consider a different missingness approach to make further contributions using this important LACDHS safety-net dataset.
+
+3. **Screening assumptions:** While variable definitions and plausibility thresholds were documented and grounded in relevant literature, the specific bounds remain project decisions. As the chosen bounds were on the permissive side, future studies might want to investigate stricter bounds to biologically implausible values.
+
+4. **Variable restrictions:** The readily available dataset is, as previously stated, a valuable asset to DR research. Despite that, the source study authors decided to remove many variables from the public dataset, either because they were unnecessary for the source study, or to improve privacy. The former could be particularly useful for epidemiological research, encouraging alternate access routes to the source author's raw data.
+
+---
+
+# References {-}
+
+American Diabetes Association Professional Practice Committee for Diabetes (2026) 'Standards of Care in Diabetes—2026', *Diabetes Care*, 49(Suppl. 1), pp. S1–S352. (Section 6: 'Glycemic Goals, Hypoglycemia, and Hyperglycemic Crises', pp. S132–S149, https://doi.org/10.2337/dc26-S006; Section 10: 'Cardiovascular Disease and Risk Management', pp. S216–S245, https://doi.org/10.2337/dc26-S010; Section 11: 'Chronic Kidney Disease and Risk Management', pp. S246–S260, https://doi.org/10.2337/dc26-S011).
+
+Barros, A.J.D. and Hirakata, V.N. (2003) 'Alternatives for logistic regression in cross-sectional studies: an empirical comparison of models that directly estimate the prevalence ratio', *BMC Medical Research Methodology*, 3, 21. Available at: https://doi.org/10.1186/1471-2288-3-21
+
+Chatterjee, P. (2025) 'Saving the Health Care Safety Net: Progress and Opportunities', *Annual Review of Public Health*, 46, pp. 525–539. Available at: https://doi.org/10.1146/annurev-publhealth-071823-121237
+
+Daskivich, L., Gandhi, M. and Ogunyemi, O. (2026) *Data from: Detecting diabetic retinopathy through machine learning on electronic health record data from an urban, safety net healthcare system* [Dataset]. Dryad. Available at: https://doi.org/10.5061/dryad.jwstqjqrm
+
+Desai, T., Ritchie, F. and Welpton, R. (2016) *Five Safes: designing data access for research*. Economics Working Paper Series 1601. Bristol: University of the West of England.
+
+Kahn, M.G., Callahan, T.J., Barnard, J., Bauck, A.E., Brown, J., Davidson, B.N., Estiri, H., Goerg, C., Holve, E., Johnson, S.G., Liaw, S.-T., Hamilton-Lopez, M., Meeker, D., Ong, T.C., Ryan, P., Shang, N., Weiskopf, N.G., Weng, C., Zozus, M.N. and Schilling, L. (2016) 'A harmonized data quality assessment terminology and framework for the secondary use of electronic health record data', *eGEMs (Generating Evidence & Methods to improve patient outcomes)*, 4(1), 1244. Available at: https://doi.org/10.13063/2327-9214.1244
+
+Ogunyemi, O.I., Gandhi, M., Lee, M., Teklehaimanot, S., Daskivich, L.P., Hindman, D., Lopez, K. and Taira, R.K. (2021) 'Detecting diabetic retinopathy through machine learning on electronic health record data from an urban, safety net healthcare system', *JAMIA Open*, 4(3), ooab066. Available at: https://doi.org/10.1093/jamiaopen/ooab066
+
+Sivaprasad, S. et al. (2025) 'New targets in diabetic retinopathy: addressing limitations of current treatments through the Sema3A/Nrp1 pathway', *Eye*, 39(18), pp. 3209–3217. Available at: https://doi.org/10.1038/s41433-025-03835-w
+
+Teo, Z.L., Tham, Y.-C., Yu, M., Chee, M.L., Rim, T.H., Cheung, N., Bikbov, M.M., Wang, Y.X., Tang, Y., Lu, Y., Wong, I.Y., Ting, D.S.W., Tan, G.S.W., Jonas, J.B., Sabanayagam, C., Wong, T.Y. and Cheng, C.-Y. (2021) 'Global Prevalence of Diabetic Retinopathy and Projection of Burden through 2045: Systematic Review and Meta-analysis', *Ophthalmology*, 128(11), pp. 1580–1591. Available at: https://doi.org/10.1016/j.ophtha.2021.04.027
+
+Wilkinson, M.D. et al. (2016) 'The FAIR Guiding Principles for scientific data management and stewardship', *Scientific Data*, 3, 160018. Available at: https://doi.org/10.1038/sdata.2016.18
+
+Zeileis, A. (2006) 'Object-oriented computation of sandwich estimators', *Journal of Statistical Software*, 16(9), pp. 1–16. Available at: https://doi.org/10.18637/jss.v016.i09
+
+Zou, G. (2004) 'A modified Poisson regression approach to prospective studies with binary data', *American Journal of Epidemiology*, 159(7), pp. 702–706. Available at: https://doi.org/10.1093/aje/kwh090
+
+---
+
+# Appendix: Reproducibility Metadata & Session Information {-}
+
+```{r appendix, echo=FALSE}
+# combine raw Dryad source checksums and exported ARD CSV checksum into one table
+all_checksums <- bind_rows(
+  raw_checksums,
+  tibble(
+    file_key = "ard_csv",
+    filename = basename(ard_csv_path),
+    sha256   = ard_sha256,
+    size_kb  = round(file.info(ard_csv_path)$size / 1024, 1)
+  )
+)
+
+kable(
+  all_checksums,
+  caption = "Appendix Table A1: SHA-256 Provenance Digests for Raw Dryad Source Files and Exported ARD."
+)
+
+# format sessionInfo() into a clean tibble for theme-compatible table rendering
+si <- sessionInfo()
+
+session_tbl <- bind_rows(
+  tibble(
+    Category  = "Environment",
+    Component = c("R Version", "Platform", "Operating System"),
+    Version   = c(
+      si$R.version$version.string,
+      si$platform,
+      ifelse(is.null(si$running), NA_character_, si$running)
+    )
+  ),
+  tibble(
+    Category  = "Attached Package",
+    Component = names(si$otherPkgs),
+    Version   = vapply(si$otherPkgs, function(p) p$Version, character(1))
+  )
+)
+
+kable(
+  session_tbl,
+  caption = "Appendix Table A2: R Environment and Attached Package Versions."
+)
+
+```

@@ -1,0 +1,7 @@
+# Reproducible GitHub Archive: LACDHS Diabetic Retinopathy ARD (`HDS_M1_Seraina Kull_2611`)
+
+## Reproducibility
+1. Place all six downloaded Dryad analytic CSV files (`doi:10.5061/dryad.jwstqjqrm`) in data/raw/ relative to this Rmd file; place ARD_validation.R beside the Rmd. Retain the CSS (auburn.css), HTML (darkmode.html) and attached-PDF (Assignment coversheet_Seraina Kull.pdf & Confidentiality_and_Data_protection_in_health_research_Seraina Kull.pdf) assets and place them beside the Rmd.
+2. Run rmarkdown::render('HDS_M1_Seraina Kull_2611.Rmd') in R (>=4.2.0) or click 'Knit the current document' in RStudio. Packages must be available; setup attempts to install missing packages require an internet connection. Please also see the VLE submission (HDS_M1_Seraina-Kull_2611.html) for exact session information that created the intended HTML report
+3. The pipeline computes SHA-256 digests identifying the input files, checks the ARD specification and saved CSV/RDS, and regenerates data/ard/ and metadata/. Input digests are not compared with a trusted external manifest.
+4. For best performance, open the report HTML in Chrome or Edge browser. The PDF files will not render in the RStudio HTML viewer. As both PDFs contain information that is not suitable to be shared in a public repository, please refer to the VLE submission for the Safe Researcher Training Evidence and the Coversheet instead.

@@ -1,0 +1,257 @@
+/* --- Theme Variables --- */
+:root {
+  --bg-page: #fdfcfb;
+  --bg-surface: #f5efe9;
+  --bg-code: #f6f1ed;
+  --text-main: #2b211e;
+  --text-muted: #6e5d56;
+  --accent: #8c3b2b;         /* Rich auburn */
+  --accent-hover: #6b291c;   /* Deep chestnut */
+  --accent-tint: rgba(140, 59, 43, 0.10);
+  --border: #e6dcd5;
+}
+
+[data-theme="dark"] {
+  --bg-page: #191412;        /* Roasted espresso */
+  --bg-surface: #241d1a;     /* Dark walnut */
+  --bg-code: #221b18;
+  --text-main: #ebe3de;      /* Warm parchment */
+  --text-muted: #a3938b;
+  --accent: #d47a63;         /* Warm copper/auburn */
+  --accent-hover: #e59580;
+  --accent-tint: rgba(212, 122, 99, 0.16);
+  --border: #382e29;
+}
+
+/* --- Base Layout & Typography --- */
+body {
+  background-color: var(--bg-page);
+  color: var(--text-main);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.65;
+  padding-bottom: 64px;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  color: var(--text-main);
+  font-weight: 600;
+  margin-top: 1.6em;
+}
+
+h1.title {
+  color: var(--accent);
+  font-size: 32px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.35em;
+  margin-top: 0.5em;
+}
+
+h3.subtitle,
+.subtitle {
+  color: var(--text-muted);
+  font-size: 20px;
+  font-weight: 400;
+  margin-top: 0.4em;
+  margin-bottom: 0.8em;
+}
+
+h4.author {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 1.5rem;
+  margin-bottom: 0.2em;
+}
+
+h4.date {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-size: 1.1rem;
+  margin-top: 0;
+}
+
+a {
+  color: var(--accent);
+}
+
+a:hover, a:focus {
+  color: var(--accent-hover);
+}
+
+blockquote {
+  border-left: 3px solid var(--accent);
+  color: var(--text-muted);
+  background-color: var(--bg-surface);
+  padding: 0.6em 1em;
+}
+
+hr {
+  border-top: 1px solid var(--border);
+}
+
+/* --- Left Floating TOC --- */
+#TOC {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background-color: var(--bg-surface);
+  padding: 6px 0;
+  margin-top: 24px;
+}
+
+.tocify-header {
+  text-indent: 0;
+}
+
+.tocify-subheader {
+  text-indent: 0;
+  font-size: 0.82em;
+}
+
+.tocify-subheader .list-group-item { padding-left: 26px; }
+
+.list-group-item {
+  background-color: transparent;
+  color: var(--text-muted);
+  border: none;
+  border-left: 3px solid transparent;
+  padding: 6px 14px;
+  transition: all 0.15s ease;
+}
+
+.list-group-item:hover,
+.list-group-item:focus {
+  background-color: var(--accent-tint);
+  color: var(--text-main);
+}
+
+.list-group-item.active,
+.list-group-item.active:hover,
+.list-group-item.active:focus {
+  background-color: var(--accent-tint);
+  color: var(--accent);
+  font-weight: 600;
+  border-left: 3px solid var(--accent);
+  border-color: transparent transparent transparent var(--accent);
+}
+
+caption,
+.table > caption,
+.table-responsive > .table > caption,
+[class*="lightable-"] caption {
+  color: var(--text-main) !important;
+  font-weight: 500;
+  padding-bottom: 8px;
+}
+
+/* --- Show/Hide Code Buttons & Dropdowns --- */
+.code-folding-btn,
+#header .btn-group > .dropdown-toggle {
+  background-color: var(--bg-surface);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.8rem;
+  transition: all 0.15s ease;
+}
+
+.code-folding-btn:hover,
+.code-folding-btn:focus,
+.code-folding-btn:active,
+.open > .dropdown-toggle.code-folding-btn,
+#header .btn-group > .dropdown-toggle:hover,
+#header .btn-group > .dropdown-toggle:focus,
+#header .btn-group > .dropdown-toggle:active,
+#header .open > .dropdown-toggle {
+  background-color: var(--accent) !important;
+  color: #ffffff !important;
+  border-color: var(--accent) !important;
+}
+
+.dropdown-menu {
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border);
+}
+
+.dropdown-menu > li > a {
+  color: var(--text-main);
+}
+
+.dropdown-menu > li > a:hover,
+.dropdown-menu > li > a:focus {
+  background-color: var(--accent-tint);
+  color: var(--accent);
+}
+
+/* --- Code Blocks & Dark Mode Syntax --- */
+pre, code {
+  background-color: var(--bg-code);
+  color: var(--text-main);
+  border-color: var(--border);
+}
+
+pre {
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 10px 14px;
+}
+
+/* Adjust Pandoc 'tango' syntax colors so they remain legible in dark mode */
+[data-theme="dark"] code span.kw { color: #e08e79; font-weight: bold; } /* Keywords */
+[data-theme="dark"] code span.dt { color: #d4a373; }                    /* Data types */
+[data-theme="dark"] code span.dv,
+[data-theme="dark"] code span.fl { color: #8abeb7; }                    /* Numbers */
+[data-theme="dark"] code span.st { color: #a3be8c; }                    /* Strings */
+[data-theme="dark"] code span.co { color: #8c7b73; font-style: italic; }/* Comments */
+[data-theme="dark"] code span.fu { color: #e5c07b; }                    /* Functions */
+[data-theme="dark"] code span.op { color: #d8dee9; }                    /* Operators */
+
+/* --- Tables & Tabsets --- */
+.table > thead > tr > th,
+.table > tbody > tr > td {
+  border-color: var(--border);
+}
+
+.table-striped > tbody > tr:nth-of-type(odd) {
+  background-color: var(--bg-surface);
+}
+
+.nav-tabs {
+  border-bottom: 1px solid var(--border);
+}
+
+.nav-tabs > li.active > a,
+.nav-tabs > li.active > a:hover,
+.nav-tabs > li.active > a:focus {
+  background-color: var(--bg-surface);
+  color: var(--accent);
+  border: 1px solid var(--border);
+  border-bottom-color: transparent;
+}
+
+.nav-tabs > li > a:hover {
+  background-color: var(--accent-tint);
+  border-color: var(--border);
+}
+
+/* --- Dark Mode Floating Toggle Button --- */
+#theme-toggle {
+  position: fixed;
+  bottom: 20px;
+  left: 20px;
+  z-index: 1050;
+  background-color: var(--bg-surface);
+  color: var(--text-main);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 6px 14px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  transition: all 0.2s ease;
+}
+
+#theme-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
